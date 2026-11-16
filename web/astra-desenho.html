@@ -1,0 +1,63 @@
+<!doctype html>
+<!-- Desenhos dos amigos por cima da tela que você está transmitindo (main.js "risco").
+     Cada risco some sozinho 3 segundos depois do último ponto. -->
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+  "use strict";
+  const FICA = 2000, SOME = 1000;   // fica 2 s inteiro e some em 1 s
+  const c = document.getElementById("c");
+  const ctx = c.getContext("2d");
+  const riscos = new Map();
+  let rodando = false;
+
+  // r = {id, cor, pts: [[x, y], ...]} com x e y de 0 a 1 (fração do monitor)
+  window.desenhar = (r) => {
+    let k = riscos.get(r.id);
+    if (!k) { k = { cor: r.cor, pts: [] }; riscos.set(r.id, k); }
+    for (const p of r.pts) k.pts.push(p);
+    k.t = performance.now();
+    if (!rodando) { rodando = true; requestAnimationFrame(quadro); }
+  };
+
+  function quadro(agora) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    ctx.clearRect(0, 0, w, h);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    // Riscos primeiro, borracha por cima: a borracha sempre ganha da caneta.
+    for (const vez of [false, true]) {
+      ctx.globalCompositeOperation = vez ? "destination-out" : "source-over";
+      for (const [id, k] of riscos) {
+        if ((k.cor === "borracha") !== vez) continue;
+        const idade = agora - k.t;
+        if (idade > FICA + SOME) { riscos.delete(id); continue; }
+        ctx.globalAlpha = vez || idade < FICA ? 1 : 1 - (idade - FICA) / SOME;
+        ctx.strokeStyle = vez ? "#000" : k.cor;
+        ctx.lineWidth = (vez ? 40 : 5) * dpr;
+        ctx.shadowColor = "rgba(0,0,0,.6)";
+        ctx.shadowBlur = vez ? 0 : 4 * dpr;
+        ctx.beginPath();
+        k.pts.forEach(([x, y], i) => (i ? ctx.lineTo(x * w, y * h) : ctx.moveTo(x * w, y * h)));
+        if (k.pts.length === 1) ctx.lineTo(k.pts[0][0] * w + 0.1, k.pts[0][1] * h);
+        ctx.stroke();
+      }
+    }
+    ctx.globalCompositeOperation = "source-over";
+    if (riscos.size) requestAnimationFrame(quadro);
+    else { ctx.clearRect(0, 0, w, h); rodando = false; }
+  }
+</script>
+</body>
+</html>
