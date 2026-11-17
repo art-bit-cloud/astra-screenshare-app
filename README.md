@@ -22,11 +22,11 @@ publicado para que qualquer pessoa possa conferir o que o programa faz no seu co
 O servidor não faz parte deste repositório.
 
 ## Versão deste código
-**3.0.17** — o mesmo código do instalador `AstraScreenShare-Instalador-3.0.17.exe` distribuído em astrascreenshare.com.
+**3.0.18** — o mesmo código do instalador `AstraScreenShare-Instalador-3.0.18.exe` distribuído em astrascreenshare.com.
 
 | Arquivo | SHA-256 |
 |---|---|
-| `AstraScreenShare-Instalador-3.0.17.exe` | `fc760b4facd234e3efd2cff8392c4910618115ad0cc21e4dba6d99a25fb6b354` |
+| `AstraScreenShare-Instalador-3.0.18.exe` | `2bc1cfa1f992ea5f4a6694287eed442dfe619bd6a5847f080cfdc9ba946c9dea` |
 | `src-tauri/som/astra-audio.exe` | `8c5b761bf052a47539e640f0157069745cbad8098fce6a80496dc9e188c86880` |
 
 O instalador não é byte a byte reproduzível (carimbo de tempo do NSIS e da compilação), mas sai deste código com:
@@ -35,6 +35,8 @@ O instalador não é byte a byte reproduzível (carimbo de tempo do NSIS e da co
 npm ci
 npx tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc
 ```
+
+3.0.18: confirmação nativa do Windows antes de começar a capturar (a página não consegue confirmar sozinha).
 
 Correções da 3.0.17 (auditoria de segurança de 16/11/2026): a captura inteira (tela, som, teclas, "não perturbe")
 para no programa ao parar, ao recarregar a página e pelo ícone perto do relógio, mesmo com a página travada;

@@ -756,6 +756,20 @@ async fn captura_iniciar(app: AppHandle, w: WebviewWindow, largura: u32, altura:
     // 2.7.33: só logo depois de escolher a tela (30 s), e a escolha vale uma vez.
     let escolha = st.escolha.lock().unwrap().take().filter(|e| e.em.elapsed() < Duration::from_secs(30))
         .ok_or("Escolha a tela na janela \"Transmitir tela\".")?;
+    // 3.0.18 (ASTRA-001): confirmação NATIVA do Windows (a página não consegue clicar nela). Um clique
+    // qualquer no Astra não basta mais para começar a capturar.
+    if !(teste() && std::env::var("ASTRA_TESTE_TOQUE").is_ok()) {
+        let (app_p, nome, tela) = (app.clone(), escolha.fonte.nome.clone(), escolha.fonte.tela);
+        let sim = tauri::async_runtime::spawn_blocking(move || {
+            let dono = principal(&app_p).as_ref().and_then(hwnd);
+            sistema::perguntar(dono, "AstraScreenShare - transmitir",
+                &format!("Começar a transmitir {} \"{}\"?\n\nQuem está na sala vai ver o que aparecer nela.",
+                    if tela { "a tela" } else { "a janela" }, nome.chars().take(80).collect::<String>()))
+        }).await.unwrap_or(false);
+        if !sim {
+            return Err("Transmissão cancelada.".into());
+        }
+    }
     let (selecao, sem_mouse) = (escolha.fonte.selecao.clone(), st.sem_mouse);
     let app2 = app.clone();
     let rotulo = tauri::async_runtime::spawn_blocking(move || janelas::abrir_captura(&app2, &selecao, sem_mouse, largura, altura, qps))
