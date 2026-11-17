@@ -57,7 +57,7 @@ pub fn abrir_captura(app: &AppHandle, selecao: &str, sem_mouse: bool, largura: u
     }
     // --lang=pt-BR: o nome das telas ("Tela inteira", "Tela 1") depende do idioma, e é por ele que a
     // fonte é escolhida. AllowWgcScreenCapturer desligado = captura antiga, que esconde o mouse em jogos.
-    let desligar = format!("msWebOOUI,msPdfOOUI,msSmartScreenProtection,WebRtcHideLocalIpsWithMdns,SpareRendererForSitePerProcess,Translate,MediaRouter,OptimizationHints,AutofillServerCommunication{}",
+    let desligar = format!("msWebOOUI,msPdfOOUI,msSmartScreenProtection,WebRtcHideLocalIpsWithMdns,SpareRendererForSitePerProcess,Translate,MediaRouter,OptimizationHints,AutofillServerCommunication,CalculateNativeWinOcclusion{}",
         if sem_mouse { ",AllowWgcScreenCapturer" } else { "" });
     let args = format!("--disable-features={} --lang=pt-BR --auto-select-desktop-capture-source=\"{}\"", desligar, selecao.replace('"', ""));
     let pagina = format!("astra-captura.html?l={}&a={}&q={}", largura.min(4096), altura.min(4096), qps.clamp(1, 240));
@@ -73,7 +73,7 @@ pub fn abrir_captura(app: &AppHandle, selecao: &str, sem_mouse: bool, largura: u
             .focused(false)
             .data_directory(pasta)
             .additional_browser_args(&args)
-            .on_navigation(|u| u.host_str() == Some("tauri.localhost") && u.path() == "/astra-captura.html")
+            .on_navigation(|u| crate::origem_exata(u, &["/astra-captura.html"]))
             .on_new_window(|_, _| NewWindowResponse::Deny)
             .build()
             .map(|w| {
@@ -319,8 +319,20 @@ fn criar_sobreposta(app: &AppHandle, rotulo: &str, pagina: &str, pronto: impl Fn
 
 // ---------- pop-up do chat ----------
 // O pop-up é desenhado para uma tela de 670 px de largura e aumenta na proporção da tela de verdade.
+// 3.0.15: cada mexida (posição, tamanho, zoom) numa janela do WebView2 espera o processo do navegador dele;
+// com o jogo pesando, isso prendia a janela inteira. Só mexe quando a tela mudou.
+static POPUP_POS: Mutex<Option<(i32, i32, i32, i32, u64)>> = Mutex::new(None);
+
 fn posicionar_popup(w: &WebviewWindow) {
     let (x, y, l, a, esc) = sistema::area_do_monitor(true);
+    {
+        let chave = (x, y, l as i32, a as i32, esc.to_bits());
+        let mut g = POPUP_POS.lock().unwrap();
+        if *g == Some(chave) {
+            return;
+        }
+        *g = Some(chave);
+    }
     let largura_dip = l as f64 / esc;
     let zoom = (largura_dip / 670.0).max(1.0);
     let lp = (200.0 * zoom * esc).round() as i32;
@@ -358,6 +370,7 @@ pub fn mostrar_no_popup(app: &AppHandle, m: serde_json::Value) {
     j.vez_popup.fetch_add(1, SeqCst);
     let txt = m.to_string();
     if existe.is_none() {
+        *POPUP_POS.lock().unwrap() = None;   // janela nova: posiciona de novo
         j.popup_pronto.store(false, SeqCst);
         j.popup_fila.lock().unwrap().push(txt);
         let protegido = estado(app).protegido.load(SeqCst) || crate::som::silencio_ligado();
@@ -391,10 +404,11 @@ pub fn popup_vazio(app: &AppHandle) {
     let vez = j.vez_popup.fetch_add(1, SeqCst) + 1;
     let app = app.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(60));
+        std::thread::sleep(Duration::from_secs(600));
         if estado(&app).janelas.vez_popup.load(SeqCst) == vez {
             if let Some(w) = app.get_webview_window("popup") {
                 if !w.is_visible().unwrap_or(true) {
+                    *POPUP_POS.lock().unwrap() = None;
                     let _ = w.destroy();
                 }
             }
@@ -494,7 +508,24 @@ pub fn vigiar_processo(app: &AppHandle, w: &WebviewWindow) {
                     else if tipo == COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED { "placa-de-video" }
                     else if tipo == COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED { "quadro" }
                     else { "outro" };
-                diario(&format!("processo do WebView2 caiu: {} ({})", nome, tipo.0));
+                // 3.0.12: o motivo e o código de saída (falta de memória? erro?) vão junto no aviso.
+                let mut detalhe = String::new();
+                if let Some(a) = &args {
+                    if let Ok(a2) = windows::core::Interface::cast::<ICoreWebView2ProcessFailedEventArgs2>(a) {
+                        let mut motivo = COREWEBVIEW2_PROCESS_FAILED_REASON::default();
+                        let mut codigo: i32 = 0;
+                        let _ = a2.Reason(&mut motivo);
+                        let _ = a2.ExitCode(&mut codigo);
+                        let m = if motivo == COREWEBVIEW2_PROCESS_FAILED_REASON_OUT_OF_MEMORY { "sem-memoria" }
+                            else if motivo == COREWEBVIEW2_PROCESS_FAILED_REASON_CRASHED { "erro" }
+                            else if motivo == COREWEBVIEW2_PROCESS_FAILED_REASON_UNRESPONSIVE { "travou" }
+                            else if motivo == COREWEBVIEW2_PROCESS_FAILED_REASON_TERMINATED { "encerrado" }
+                            else if motivo == COREWEBVIEW2_PROCESS_FAILED_REASON_LAUNCH_FAILED { "nao-abriu" }
+                            else { "inesperado" };
+                        detalhe = format!(" [{} 0x{:08X}]", m, codigo as u32);
+                    }
+                }
+                diario(&format!("processo do WebView2 caiu: {} ({}){}", nome, tipo.0, detalhe));
                 let mut acao = "nada";
                 if tipo == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {
                     let agora = std::time::Instant::now();
@@ -517,7 +548,7 @@ pub fn vigiar_processo(app: &AppHandle, w: &WebviewWindow) {
                 }
                 let mut p = FALHA_PENDENTE.lock().unwrap();
                 if p.is_none() {
-                    *p = Some(format!("WebView2 caiu: {} -> {}", nome, acao));
+                    *p = Some(format!("WebView2 caiu: {}{} -> {}", nome, detalhe, acao));
                 }
                 Ok(())
             })),
@@ -527,11 +558,15 @@ pub fn vigiar_processo(app: &AppHandle, w: &WebviewWindow) {
 }
 
 // Chamado quando a página principal termina de carregar: manda o aviso guardado (se houver).
+pub static PILHA_PENDENTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 pub fn avisar_falha(w: &WebviewWindow) {
     let Some(msg) = FALHA_PENDENTE.lock().unwrap().take() else { return };
+    let pilha = PILHA_PENDENTE.lock().unwrap().take().unwrap_or_default();
     let js = format!(
-        "setTimeout(()=>{{try{{enviar({{t:'erro-app',msg:{},onde:'webview2',pilha:'',versao:(typeof programa!=='undefined'&&programa&&programa.versao)||'pc'}})}}catch(e){{}}}},15000)",
-        serde_json::to_string(&msg).unwrap_or_else(|_| "\"?\"".into())
+        "setTimeout(()=>{{try{{enviar({{t:'erro-app',msg:{},onde:'webview2',pilha:{},versao:(typeof programa!=='undefined'&&programa&&programa.versao)||'pc'}})}}catch(e){{}}}},15000)",
+        serde_json::to_string(&msg).unwrap_or_else(|_| "\"?\"".into()),
+        serde_json::to_string(&pilha).unwrap_or_else(|_| "\"\"".into())
     );
     let _ = w.eval(js);
 }

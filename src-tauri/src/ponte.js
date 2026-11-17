@@ -30,6 +30,17 @@
 
   let aoSom = null;
 
+  // 3.0.16: arrastar a janela pelas barras marcadas com --arrastar: 1 no CSS (antes era -webkit-app-region,
+  // que fazia o WebView2 criar ~200 janelinhas e recriá-las a cada mudança: a janela travava).
+  document.addEventListener("mousedown", (e) => {
+    if (e.button !== 0 || !(e.target instanceof Element)) return;
+    if (getComputedStyle(e.target).getPropertyValue("--arrastar").trim() !== "1") return;
+    e.preventDefault();
+    solto("janela", { acao: e.detail >= 2 ? "max" : "arrastar" });
+  }, true);
+  let somWs = null;   // 3.0.14: som pela conexão local (não passa pela linha principal da janela)
+  function fecharSomWs() { if (somWs) { try { somWs.onmessage = null; somWs.close(); } catch (_) {} somWs = null; } }
+
   window.astra = Object.freeze({
     servidor: I.servidor,
     site: I.site,
@@ -54,12 +65,24 @@
       foto: String(m.foto || ""), imagem: String(m.imagem || ""), gif: !!m.gif, tipo: String(m.tipo || "") } }),
     listarFontes: () => chamar("listar_fontes"),
     definirFonte: (e) => chamar("definir_fonte", { id: String((e && e.id) || ""), som: String((e && e.som) || "") }),
-    iniciarSom: () => {
+    iniciarSom: async () => {
+      fecharSomWs();
       const c = new (nucleo().Channel)();
       c.onmessage = (d) => { if (aoSom) aoSom(d instanceof Uint8Array ? d : new Uint8Array(d)); };
-      return chamar("som_iniciar", { canal: c });
+      const r = await chamar("som_iniciar", { canal: c });
+      // Se a conexão local não abrir ou cair, o programa continua mandando pelo Channel acima.
+      if (r && r.ok && r.porta && r.chave) {
+        try {
+          const ws = new WebSocket(`ws://127.0.0.1:${r.porta}/${r.chave}`);
+          ws.binaryType = "arraybuffer";
+          ws.onmessage = (e) => { if (aoSom && e.data instanceof ArrayBuffer) aoSom(new Uint8Array(e.data)); };
+          ws.onclose = () => { if (somWs === ws) somWs = null; };
+          somWs = ws;
+        } catch (_) {}
+      }
+      return r && r.ok ? { ok: true } : r;
     },
-    pararSom: () => solto("som_parar"),
+    pararSom: () => { fecharSomWs(); solto("som_parar"); },
     aoReceberSom: (cb) => { aoSom = typeof cb === "function" ? cb : null; },
     silencio: (sim) => solto("silencio", { sim: !!sim }),
     risco: (r) => solto("risco", { r }),

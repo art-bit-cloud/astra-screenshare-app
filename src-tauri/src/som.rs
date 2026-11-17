@@ -4,7 +4,11 @@
 //  - teclas: "D <código>" / "U <código>" por linha;
 //  - desempenho: "GPU <total> <pid>:<uso> ..." por linha.
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::Arc;
+use std::time::Duration;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -45,8 +49,130 @@ fn matar(m: &Mutex<Option<Child>>) {
 
 // ---------- som do PC ----------
 // Responde quando o capturador disser "OK" (ou o erro dele). `ao_fechar` roda quando ele sai.
+// ---------- 3.0.14: som por conexão local (WebSocket em 127.0.0.1) ----------
+// O Channel do Tauri passa cada pedaço de som 2x pela linha principal da janela (~25 vezes/s ao vivo com
+// som). Pela conexão local o som vai do capturador direto para a página, sem tocar nela. Só aceita a página
+// do programa (Origin tauri.localhost) com a chave aleatória desta captura. Se a página não conectar ou a
+// conexão cair, o som continua pelo Channel, como antes.
+struct SomWs {
+    cliente: Mutex<Option<TcpStream>>,
+    fim: AtomicBool,
+}
+
+fn chave_aleatoria() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let agora = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    (0..4u64).map(|i| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(i);
+        h.write_u128(agora);
+        h.write_u32(std::process::id());
+        format!("{:016x}", h.finish())
+    }).collect()
+}
+
+fn abrir_ws() -> Option<(u16, String, Arc<SomWs>)> {
+    let l = TcpListener::bind("127.0.0.1:0").ok()?;
+    let porta = l.local_addr().ok()?.port();
+    l.set_nonblocking(true).ok()?;
+    let chave = chave_aleatoria();
+    let ws = Arc::new(SomWs { cliente: Mutex::new(None), fim: AtomicBool::new(false) });
+    let (w2, k2) = (ws.clone(), chave.clone());
+    std::thread::spawn(move || {
+        let inicio = std::time::Instant::now();
+        // espera a página conectar (até 20 s); depois disso fica só o Channel
+        while !w2.fim.load(SeqCst) && inicio.elapsed() < Duration::from_secs(20) {
+            match l.accept() {
+                Ok((s, _)) => {
+                    if let Some(s) = aperto_de_mao(s, &k2) {
+                        if !w2.fim.load(SeqCst) {
+                            *w2.cliente.lock().unwrap() = Some(s);
+                        }
+                        return;
+                    }
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(30)),
+            }
+        }
+    });
+    Some((porta, chave, ws))
+}
+
+fn aperto_de_mao(mut s: TcpStream, chave: &str) -> Option<TcpStream> {
+    use base64::Engine;
+    use sha1::{Digest, Sha1};
+    s.set_nonblocking(false).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    let mut pedido = Vec::new();
+    let mut b = [0u8; 1024];
+    while !pedido.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = s.read(&mut b).ok()?;
+        if n == 0 || pedido.len() > 8192 {
+            return None;
+        }
+        pedido.extend_from_slice(&b[..n]);
+    }
+    let txt = String::from_utf8_lossy(&pedido);
+    let mut linhas = txt.split("\r\n");
+    if linhas.next()? != format!("GET /{} HTTP/1.1", chave) {
+        return None;
+    }
+    let (mut chave_ws, mut origem_ok) = (None, false);
+    for l in linhas {
+        let Some((n, v)) = l.split_once(':') else { continue };
+        let (n, v) = (n.trim().to_ascii_lowercase(), v.trim());
+        if n == "sec-websocket-key" {
+            chave_ws = Some(v.to_string());
+        } else if n == "origin" {
+            origem_ok = v == "http://tauri.localhost" || v == "https://tauri.localhost";
+        }
+    }
+    if !origem_ok {
+        return None;
+    }
+    let mut h = Sha1::new();
+    h.update(chave_ws?.as_bytes());
+    h.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let aceite = base64::engine::general_purpose::STANDARD.encode(h.finalize());
+    s.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", aceite).as_bytes()).ok()?;
+    s.set_nodelay(true).ok()?;
+    s.set_write_timeout(Some(Duration::from_millis(300))).ok()?;
+    Some(s)
+}
+
+// Um quadro binário do servidor (sem máscara), cabeçalho e dados numa escrita só.
+fn mandar_quadro(s: &mut TcpStream, dados: &[u8]) -> std::io::Result<()> {
+    let mut q = Vec::with_capacity(dados.len() + 10);
+    q.push(0x82);
+    if dados.len() < 126 {
+        q.push(dados.len() as u8);
+    } else if dados.len() <= 65535 {
+        q.push(126);
+        q.extend_from_slice(&(dados.len() as u16).to_be_bytes());
+    } else {
+        q.push(127);
+        q.extend_from_slice(&(dados.len() as u64).to_be_bytes());
+    }
+    q.extend_from_slice(dados);
+    s.write_all(&q)
+}
+
+// Manda pela conexão local se a página estiver ligada nela; devolve false para usar o Channel.
+fn pelo_ws(ws: &Option<Arc<SomWs>>, dados: &[u8]) -> bool {
+    let Some(ws) = ws else { return false };
+    let mut g = ws.cliente.lock().unwrap();
+    let Some(s) = g.as_mut() else { return false };
+    if mandar_quadro(s, dados).is_ok() {
+        return true;
+    }
+    if let Some(s) = g.take() {
+        let _ = s.shutdown(Shutdown::Both);
+    }
+    false
+}
+
 pub fn som_iniciar(app: &tauri::AppHandle, args: Vec<String>, canal: Channel<InvokeResponseBody>,
-                   ao_fechar: impl FnOnce() + Send + 'static) -> Result<(), String> {
+                   ao_fechar: impl FnOnce() + Send + 'static) -> Result<Option<(u16, String)>, String> {
     som_parar();
     let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut filho = abrir(app, &a, false, true, true)?;
@@ -71,6 +197,10 @@ pub fn som_iniciar(app: &tauri::AppHandle, args: Vec<String>, canal: Channel<Inv
             }
         }
     });
+    let ws = abrir_ws();
+    let endereco = ws.as_ref().map(|(p, k, _)| (*p, k.clone()));
+    let ws: Option<Arc<SomWs>> = ws.map(|(_, _, w)| w);
+    let ws_fim = ws.clone();
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 16384];
         let mut sobra: Vec<u8> = Vec::new();
@@ -83,18 +213,26 @@ pub fn som_iniciar(app: &tauri::AppHandle, args: Vec<String>, canal: Channel<Inv
                     // 3.0.6: junta ~40 ms (7680 bytes) antes de mandar. Cada send do Channel passa pela
                     // thread principal (eval + fetch do IPC); pedacinhos de 10 ms = ~100 idas/s e a janela
                     // ficava "Não está respondendo" durante a live com som.
-                    if sobra.len() < 7680 && ultimo_envio.elapsed() < std::time::Duration::from_millis(60) {
+                    // 3.0.13: ~80 ms (15360 bytes): cada pedaço passa 2x pela linha principal da janela (aviso + busca);
+                    // com 40 ms eram ~50 passagens/s e a janela ficava "Não está respondendo" na live com som.
+                    if sobra.len() < 15360 && ultimo_envio.elapsed() < std::time::Duration::from_millis(110) {
                         continue;
                     }
                     let inteiro = sobra.len() - sobra.len() % 4; // quadros inteiros (2 canais x 16 bits)
                     if inteiro > 0 {
                         ultimo_envio = std::time::Instant::now();
                         let pedaco: Vec<u8> = sobra.drain(..inteiro).collect();
-                        if canal.send(InvokeResponseBody::Raw(pedaco)).is_err() {
+                        if !pelo_ws(&ws, &pedaco) && canal.send(InvokeResponseBody::Raw(pedaco)).is_err() {
                             break;
                         }
                     }
                 }
+            }
+        }
+        if let Some(w) = &ws_fim {
+            w.fim.store(true, SeqCst);
+            if let Some(s) = w.cliente.lock().unwrap().take() {
+                let _ = s.shutdown(Shutdown::Both);
             }
         }
         let _ = tx.send(Err("O capturador de som fechou.".into()));
@@ -106,7 +244,7 @@ pub fn som_iniciar(app: &tauri::AppHandle, args: Vec<String>, canal: Channel<Inv
         }
     });
     match rx.recv_timeout(std::time::Duration::from_secs(8)) {
-        Ok(r) => r,
+        Ok(r) => r.map(|_| endereco),
         Err(_) => Err("O capturador de som não respondeu.".into()),
     }
 }

@@ -6,6 +6,7 @@
 // funções, as mesmas regras de segurança e a mesma atualização assinada.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ambiguidade;
 mod atualizar;
 mod electron;
 mod fontes;
@@ -102,8 +103,15 @@ fn hwnd(w: &WebviewWindow) -> Option<windows::Win32::Foundation::HWND> {
 // ---------- 2.7.33: quem pode pedir o quê ----------
 // Só a página do próprio programa (web/index.html), na janela principal, pode pedir.
 fn eh_principal(w: &WebviewWindow) -> bool {
-    w.label() == "principal"
-        && w.url().map(|u| u.scheme() == "http" && u.host_str() == Some("tauri.localhost") && (u.path() == "/" || u.path() == "/index.html")).unwrap_or(false)
+    w.label() == "principal" && pagina_local(w, &["/", "/index.html"])
+}
+
+// 3.0.17 (ASTRA-014): origem EXATA do programa: http://tauri.localhost sem porta, só nas páginas dadas.
+pub fn origem_exata(u: &tauri::Url, caminhos: &[&str]) -> bool {
+    u.scheme() == "http" && u.host_str() == Some("tauri.localhost") && u.port().is_none() && caminhos.contains(&u.path())
+}
+pub fn pagina_local(w: &WebviewWindow, caminhos: &[&str]) -> bool {
+    w.url().map(|u| origem_exata(&u, caminhos)).unwrap_or(false)
 }
 
 // Clique ou tecla de verdade há pouco, com o Astra na frente (ou um clique no menu do ícone).
@@ -124,6 +132,173 @@ fn captura_recente(app: &AppHandle) -> bool {
     let st = estado(app);
     !st.capturando.lock().unwrap().tela.is_empty()
         && (st.transmitindo.load(SeqCst) || st.captura_em.lock().unwrap().map(|t| t.elapsed() < Duration::from_secs(60)).unwrap_or(false))
+}
+
+// ---------- 3.0.13: vigia da linha principal ----------
+// "Não está respondendo" = a linha principal da janela ficou presa. A cada segundo ela recebe um
+// "ping"; se demorar mais de 3 s, anota (em travou.txt) quanto tempo e qual foi o último comando da
+// página. Se o Windows fechar o programa, o aviso vai para o erros-app na próxima vez que abrir.
+static ULTIMO_CMD: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+fn com_registro<R: tauri::Runtime>(
+    h: impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static,
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
+    move |inv| {
+        let nome = inv.message.command().to_string();
+        if nome != "plugin:__TAURI_CHANNEL__|fetch" {
+            *ULTIMO_CMD.lock().unwrap() = Some((nome, Instant::now()));
+        }
+        h(inv)
+    }
+}
+
+// 3.0.14: "foto" da pilha da linha principal na hora da trava (módulo+deslocamento de cada chamada).
+static LINHA_PRINCIPAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PILHA_TOPO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn pilha_da_principal() -> String {
+    use windows::Win32::System::Diagnostics::Debug::*;
+    use windows::Win32::System::Threading::*;
+    let tid = LINHA_PRINCIPAL.load(SeqCst);
+    let mut end = [0u64; 48];
+    let mut n = 0usize;
+    unsafe {
+        let Ok(h) = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, false, tid) else {
+            return "sem-acesso".into();
+        };
+        let mut ctx: Box<CONTEXT> = Box::new(std::mem::zeroed());
+        ctx.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
+        // 3.0.14b: congela só para ler os registradores e solta na hora. Procurar as tabelas do Windows com a
+        // linha congelada podia esperar uma trava que ela mesma segura (= app preso para sempre).
+        let mut ok = false;
+        if SuspendThread(h) != u32::MAX {
+            ok = GetThreadContext(h, &mut *ctx).is_ok();
+            ResumeThread(h);
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(h);
+        if !ok {
+            return "sem-contexto".into();
+        }
+        // Ela está presa há 3 s, então a pilha fica parada. Mesmo assim só lê entre o Rsp e o topo da pilha.
+        let (ini, topo) = (ctx.Rsp, PILHA_TOPO.load(SeqCst));
+        let dentro = |a: u64| topo != 0 && a >= ini && a.saturating_add(256) <= topo;
+        while n < end.len() && ctx.Rip != 0 && dentro(ctx.Rsp) {
+            end[n] = ctx.Rip;
+            n += 1;
+            let antes = ctx.Rsp;
+            let mut base = 0u64;
+            let f = RtlLookupFunctionEntry(ctx.Rip, &mut base, None);
+            if f.is_null() {
+                ctx.Rip = *(ctx.Rsp as *const u64);
+                ctx.Rsp += 8;
+            } else {
+                let mut dados = std::ptr::null_mut();
+                let mut quadro = 0u64;
+                let _ = RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, f, &mut *ctx, &mut dados, &mut quadro, None);
+            }
+            if ctx.Rsp <= antes {
+                break;
+            }
+        }
+    }
+    // Junta chamadas seguidas do mesmo módulo do sistema; as do próprio app ficam com o endereço.
+    let mut partes: Vec<(String, String)> = Vec::new();
+    for &a in &end[..n] {
+        let (m, off) = modulo_de(a);
+        let curto = m.trim_end_matches(".dll").trim_end_matches(".DLL").to_string();
+        let eh_app = curto.eq_ignore_ascii_case("AstraScreenShare.exe");
+        if !eh_app {
+            let n_partes = partes.len();
+            if let Some(ult) = partes.last_mut() {
+                if ult.0 == curto && n_partes > 1 { if !ult.1.ends_with('*') { ult.1.push('*'); } continue; }
+            }
+        }
+        partes.push((if eh_app { "A".into() } else { curto }, format!("{:x}", off)));
+    }
+    partes.iter().map(|(m, o)| format!("{}+{}", m, o)).collect::<Vec<_>>().join(" ")
+}
+
+fn modulo_de(a: u64) -> (String, u64) {
+    use windows::Win32::System::LibraryLoader::*;
+    unsafe {
+        let mut hm = windows::Win32::Foundation::HMODULE::default();
+        if GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            windows::core::PCWSTR(a as *const u16), &mut hm).is_err() {
+            return ("?".into(), a);
+        }
+        let mut buf = [0u16; 260];
+        let k = GetModuleFileNameW(Some(hm), &mut buf) as usize;
+        let nome = String::from_utf16_lossy(&buf[..k]);
+        (nome.rsplit('\\').next().unwrap_or("?").to_string(), a - hm.0 as u64)
+    }
+}
+
+fn vigia_linha_principal(app: &AppHandle) {
+    if let Ok(t) = std::fs::read_to_string(arquivo(app, "travou-pilha.txt")) {
+        let _ = std::fs::remove_file(arquivo(app, "travou-pilha.txt"));
+        *janelas::PILHA_PENDENTE.lock().unwrap() = Some(t);
+    }
+    LINHA_PRINCIPAL.store(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() }, SeqCst);
+    {
+        let (mut baixo, mut alto) = (0usize, 0usize);
+        unsafe { windows::Win32::System::Threading::GetCurrentThreadStackLimits(&mut baixo, &mut alto) };
+        PILHA_TOPO.store(alto as u64, SeqCst);
+    }
+    let arq = arquivo(app, "travou.txt");
+    if let Ok(t) = std::fs::read_to_string(&arq) {
+        let _ = std::fs::remove_file(&arq);
+        let mut p = janelas::FALHA_PENDENTE.lock().unwrap();
+        if p.is_none() && !t.trim().is_empty() {
+            *p = Some(t.trim().chars().take(180).collect());
+        }
+    }
+    let app = app.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(1));
+        if estado(&app).saindo.load(SeqCst) {
+            break;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let inicio = Instant::now();
+        if app.run_on_main_thread(move || { let _ = tx.send(()); }).is_err() {
+            break;
+        }
+        if rx.recv_timeout(Duration::from_secs(3)).is_ok() {
+            continue;
+        }
+        let ultimo = || ULTIMO_CMD.lock().unwrap().as_ref()
+            .map(|(n, t)| format!("{} (há {:.1} s)", n, inicio.duration_since(*t).as_secs_f32()))
+            .unwrap_or_else(|| "nenhum".into());
+        let st = estado(&app);
+        let contexto = format!("{}{}", if st.transmitindo.load(SeqCst) { "ao vivo" } else { "parado" },
+            if st.capturando.try_lock().map(|c| c.som).unwrap_or(false) { " com som" } else { "" });
+        let antes = ultimo();
+        let pilha1 = pilha_da_principal();
+        let _ = std::fs::write(&arq, format!("Linha principal presa +3 s ({}); último comando: {}", contexto, antes));
+        // espera voltar (até 5 min) para anotar quanto durou
+        // segunda foto depois de 8 s presa: mostra se continua no mesmo lugar
+        let mut voltou = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let pilha2 = if voltou { String::new() } else { pilha_da_principal() };
+        if !voltou { voltou = rx.recv_timeout(Duration::from_secs(295)).is_ok(); }
+        *janelas::PILHA_PENDENTE.lock().unwrap() = Some(if pilha2.is_empty() || pilha2 == pilha1 { pilha1.clone() } else { format!("{} || {}", pilha1, pilha2) });
+        janelas::diario(&format!("pilha: {} || {}", pilha1, pilha2));
+        let msg = format!("Linha principal presa {:.1} s ({}){}; último comando antes: {}",
+            inicio.elapsed().as_secs_f32(), contexto, if voltou { "" } else { ", não voltou" }, antes);
+        janelas::diario(&msg);
+        if voltou {
+            let _ = std::fs::remove_file(&arq);
+            {
+                let mut p = janelas::FALHA_PENDENTE.lock().unwrap();
+                if p.is_none() { *p = Some(msg); }
+            }
+            if let Some(w) = principal(&app) {
+                janelas::avisar_falha(&w);
+            }
+        } else {
+            let _ = std::fs::write(&arq, msg);
+            if let Some(pl) = janelas::PILHA_PENDENTE.lock().unwrap().take() { let _ = std::fs::write(arquivo(&app, "travou-pilha.txt"), pl); }
+        }
+    });
 }
 
 fn enviar(app: &AppHandle, t: &str, v: Value) {
@@ -245,8 +420,20 @@ fn criar_bandeja(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, e| match e.id().as_ref() {
             "abrir" => mostrar(app),
             "tela" => {
+                let st = estado(app);
+                let ao_vivo = st.transmitindo.load(SeqCst) || !st.capturando.lock().unwrap().tela.is_empty();
+                if ao_vivo {
+                    // 3.0.17 (ASTRA-004): "Parar transmissão" para tudo AQUI, no programa, mesmo com a
+                    // página travada. Depois só avisa a página para arrumar os botões.
+                    encerrar_captura(app);
+                    if let Some(w) = principal(app) {
+                        let _ = w.eval("try{if(window.pararTelaPeloIcone)pararTelaPeloIcone();}catch(e){}");
+                    }
+                    avisar(app, "Transmissão encerrada", "A Astra parou de capturar a tela, o som e as teclas.", true);
+                    return;
+                }
                 // Clique de verdade no menu do ícone (o Windows que mandou).
-                *estado(app).toque_bandeja.lock().unwrap() = Some(Instant::now());
+                *st.toque_bandeja.lock().unwrap() = Some(Instant::now());
                 mostrar(app);
                 if let Some(w) = principal(app) {
                     let _ = w.eval("document.getElementById('bt-tela') && document.getElementById('bt-tela').click()");
@@ -329,6 +516,16 @@ fn aviso(app: AppHandle, w: WebviewWindow, titulo: String, texto: String) {
     if w.is_visible().unwrap_or(false) && estado(&app).focada.load(SeqCst) {
         return;
     }
+    // 3.0.17 (ASTRA-019): no máximo 8 avisos a cada 30 s pedidos pela página.
+    {
+        static AVISOS: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+        let mut v = AVISOS.lock().unwrap();
+        v.retain(|t| t.elapsed() < Duration::from_secs(30));
+        if v.len() >= 8 {
+            return;
+        }
+        v.push(Instant::now());
+    }
     avisar(&app, &titulo.chars().take(200).collect::<String>(), &texto.chars().take(500).collect::<String>(), false);
 }
 
@@ -337,22 +534,39 @@ fn transmitindo(app: AppHandle, w: WebviewWindow, sim: bool) {
     if !eh_principal(&w) {
         return;
     }
-    let st = estado(&app);
-    st.transmitindo.store(sim, SeqCst);
-    st.protegido.store(sim && st.tela_da_live.lock().unwrap().is_some(), SeqCst);
-    janelas::proteger_janelas(&app);
     if !sim {
-        ligar_silencio(&app, false);
-        janelas::fechar_desenho(&app);
-        ligar_teclas(&app, false);
-        parar_som(&app);
-        st.capturando.lock().unwrap().tela.clear();
-        *st.captura_em.lock().unwrap() = None;
-        if let Some(r) = st.janelas.captura_atual.lock().unwrap().clone() {
-            janelas::fechar_captura(&app, &r);
-        }
+        encerrar_captura(&app);
+        return;
     }
+    let st = estado(&app);
+    st.transmitindo.store(true, SeqCst);
+    st.protegido.store(st.tela_da_live.lock().unwrap().is_some(), SeqCst);
+    janelas::proteger_janelas(&app);
     atualizar_indicador(&app);
+}
+
+// 3.0.17 (ASTRA-003/004): UMA rotina, no Rust, que desliga tudo da live: tela, som, teclas, silêncio,
+// desenhos e a escolha pendente. Pode ser chamada várias vezes (idempotente). Vale para: a página
+// parar, a página recarregar ou travar, a captura acabar, e o "Parar transmissão" do ícone (que não
+// depende mais da página responder).
+fn encerrar_captura(app: &AppHandle) {
+    let st = estado(app);
+    st.transmitindo.store(false, SeqCst);
+    st.protegido.store(false, SeqCst);
+    ligar_silencio(app, false);
+    janelas::fechar_desenho(app);
+    ligar_teclas(app, false);
+    parar_som(app);
+    st.capturando.lock().unwrap().tela.clear();
+    *st.captura_em.lock().unwrap() = None;
+    *st.escolha.lock().unwrap() = None;
+    *st.ultimo_som.lock().unwrap() = None;
+    *st.tela_da_live.lock().unwrap() = None;
+    if let Some(r) = st.janelas.captura_atual.lock().unwrap().clone() {
+        janelas::fechar_captura(app, &r);
+    }
+    janelas::proteger_janelas(app);
+    atualizar_indicador(app);
 }
 
 #[tauri::command]
@@ -411,6 +625,8 @@ fn janela(app: AppHandle, w: WebviewWindow, acao: String) {
         "max" => { if w.is_maximized().unwrap_or(false) { let _ = w.unmaximize(); } else { let _ = w.maximize(); } }
         "fechar" => fechar_principal(&app, &w),
         "tela-cheia" => { let _ = w.set_fullscreen(!w.is_fullscreen().unwrap_or(false)); }
+        // 3.0.16: arrastar pela barra (a página não usa mais -webkit-app-region)
+        "arrastar" => { let _ = w.start_dragging(); }
         _ => {}
     }
 }
@@ -476,7 +692,7 @@ fn fechar_mini(app: AppHandle, w: WebviewWindow) {
 
 #[tauri::command]
 fn popup_vazio(app: AppHandle, w: WebviewWindow) {
-    if w.label() == "popup" {
+    if w.label() == "popup" && pagina_local(&w, &["/astra-popup.html"]) {
         janelas::popup_vazio(&app);
     }
 }
@@ -502,20 +718,32 @@ async fn listar_fontes(app: AppHandle, w: WebviewWindow) -> Vec<fontes::Fonte> {
 }
 
 #[tauri::command]
-fn definir_fonte(app: AppHandle, w: WebviewWindow, id: String, som: String) -> bool {
+fn definir_fonte(app: AppHandle, w: WebviewWindow, id: String, som: String) -> Value {
     let st = estado(&app);
     // 2.7.33: escolher a tela também precisa de um clique de verdade (no botão "Transmitir").
     if !eh_principal(&w) || !tocou_agora(&app) {
         *st.escolha.lock().unwrap() = None;
-        return false;
+        return json!({ "ok": false });
     }
-    let fonte = st.ultimas_fontes.lock().unwrap().iter().find(|f| f.id == id).cloned();
+    let (fonte, ambigua) = {
+        let lista = st.ultimas_fontes.lock().unwrap();
+        let fonte = lista.iter().find(|f| f.id == id).cloned();
+        let ambigua = fonte.as_ref().map(|f| fontes::selecao_ambigua(f, &lista)).unwrap_or(false);
+        (fonte, ambigua)
+    };
+    // 3.0.17 (ASTRA-002): o WebView2 acha a fonte por um PEDAÇO do nome e pega a primeira que tiver
+    // esse pedaço. Se outra janela/tela também tem, poderia transmitir a errada: aí recusa e explica.
+    if ambigua {
+        *st.escolha.lock().unwrap() = None;
+        janelas::diario("definir_fonte: recusada (nome ambíguo)");
+        return json!({ "ok": false, "motivo": "ambigua" });
+    }
     // Transmitindo um monitor inteiro: os desenhos dos amigos aparecem por cima dele.
     *st.tela_da_live.lock().unwrap() = fonte.as_ref().and_then(|f| f.retangulo);
     let ok = fonte.is_some();
     *st.escolha.lock().unwrap() = fonte.map(|fonte| Escolha { fonte, som: som.chars().take(20).collect(), em: Instant::now() });
     st.ultimas_fontes.lock().unwrap().clear();   // solta as miniaturas da memória
-    ok
+    json!({ "ok": ok })
 }
 
 // O getDisplayMedia da página (ponte.js) chega aqui: abre a janela de captura da fonte escolhida.
@@ -543,9 +771,20 @@ async fn captura_iniciar(app: AppHandle, w: WebviewWindow, largura: u32, altura:
 
 #[tauri::command]
 fn captura_parar(app: AppHandle, w: WebviewWindow, rotulo: String) {
-    if eh_principal(&w) {
-        janelas::fechar_captura(&app, &rotulo);
+    if !eh_principal(&w) {
+        return;
     }
+    // 3.0.17 (ASTRA-003): a captura que está no ar acabou = som, teclas e silêncio acabam junto.
+    // (Uma captura velha, que já não é a atual, só fecha a janela dela.)
+    let atual = estado(&app).janelas.captura_atual.lock().unwrap().clone();
+    if atual.as_deref() == Some(rotulo.as_str()) {
+        encerrar_captura(&app);   // já fecha a janela desta captura
+        return;
+    }
+    if atual.is_none() {
+        encerrar_captura(&app);
+    }
+    janelas::fechar_captura(&app, &rotulo);
 }
 
 #[tauri::command]
@@ -558,7 +797,7 @@ fn sinal_principal(app: AppHandle, w: WebviewWindow, msg: String) {
 #[tauri::command]
 fn sinal_captura(app: AppHandle, w: WebviewWindow, msg: String) {
     let atual = estado(&app).janelas.captura_atual.lock().unwrap().clone();
-    if atual.as_deref() == Some(w.label()) && msg.len() < 200_000 {
+    if atual.as_deref() == Some(w.label()) && pagina_local(&w, &["/astra-captura.html"]) && msg.len() < 200_000 {
         enviar(&app, "sinal", json!({ "de": w.label(), "msg": msg }));
     }
 }
@@ -574,11 +813,12 @@ fn parar_som(app: &AppHandle) {
 
 #[tauri::command]
 async fn som_iniciar(app: AppHandle, w: WebviewWindow, canal: Channel<InvokeResponseBody>) -> Value {
-    parar_som(&app);
     // 2.7.33: o som do PC só é capturado junto com uma transmissão que a pessoa começou.
+    // 3.0.17 (ASTRA-015): confere ANTES de mexer em qualquer coisa (antes parava o som primeiro).
     if !eh_principal(&w) || !captura_recente(&app) {
         return json!({ "ok": false, "erro": "O som só é capturado durante uma transmissão." });
     }
+    parar_som(&app);
     let pid = std::process::id().to_string();
     let args: Vec<String> = match estado(&app).ultimo_som.lock().unwrap().as_ref() {
         Some(e) if e.som == "janela" && !e.fonte.tela => vec!["incluir-janela".into(), e.fonte.id.trim_start_matches("janela:").to_string()],
@@ -598,7 +838,8 @@ async fn som_iniciar(app: AppHandle, w: WebviewWindow, canal: Channel<InvokeResp
         })
     }).await.unwrap_or_else(|e| Err(e.to_string()));
     match r {
-        Ok(()) => json!({ "ok": true }),
+        Ok(Some((porta, chave))) => json!({ "ok": true, "porta": porta, "chave": chave }),
+        Ok(None) => json!({ "ok": true }),
         Err(e) => {
             parar_som(&app);
             json!({ "ok": false, "erro": e })
@@ -621,9 +862,14 @@ fn ligar_silencio(app: &AppHandle, sim: bool) {
 
 #[tauri::command]
 fn silencio(app: AppHandle, w: WebviewWindow, sim: bool) {
-    if eh_principal(&w) {
-        ligar_silencio(&app, sim);
+    if !eh_principal(&w) {
+        return;
     }
+    // 3.0.17 (P0-3): o "Não perturbe" (esconder notificações) só liga durante uma transmissão de verdade.
+    if sim && !captura_recente(&app) {
+        return;
+    }
+    ligar_silencio(&app, sim);
 }
 
 // ---------- teclas apertadas (opção da live) ----------
@@ -641,8 +887,23 @@ fn ligar_teclas(app: &AppHandle, sim: bool) {
         return;
     }
     let (a1, a2, a3) = (app.clone(), app.clone(), app.clone());
+    // 3.0.17 (ASTRA-022): transmitindo uma JANELA, as teclas só vão para a live quando ela está na
+    // frente (antes iam com qualquer janela na frente, ex.: digitando no navegador). Tela inteira:
+    // como antes (tudo menos o próprio Astra).
+    let janela_da_live: Option<isize> = estado(app).ultimo_som.lock().unwrap().as_ref()
+        .filter(|e| !e.fonte.tela)
+        .and_then(|e| e.fonte.id.strip_prefix("janela:").and_then(|n| n.parse::<isize>().ok()));
     let ok = som::teclas(app, true,
-        move || estado(&a1).focada.load(SeqCst),
+        move || {
+            // true = NÃO mandar esta tecla
+            if estado(&a1).focada.load(SeqCst) {
+                return true;
+            }
+            match janela_da_live {
+                Some(h) => !sistema::janela_da_frente_eh(windows::Win32::Foundation::HWND(h as _)),
+                None => false,
+            }
+        },
         move |lista| enviar(&a2, "teclas", json!(lista)),
         move || {
             estado(&a3).capturando.lock().unwrap().teclas = false;
@@ -728,6 +989,10 @@ fn tecla_emergencia(app: AppHandle, w: WebviewWindow, acel: String) -> bool {
     if acel.is_empty() {
         return true;
     }
+    // 3.0.17 (ASTRA-019): atalho global só com Ctrl/Alt/Shift/Win, ou uma tecla F1..F24 sozinha.
+    if !atalho_permitido(&acel) {
+        return false;
+    }
     let ok = app.global_shortcut().on_shortcut(acel.as_str(), |app, _, e| {
         if e.state == ShortcutState::Pressed {
             janelas::fechar_desenho(app);
@@ -738,6 +1003,21 @@ fn tecla_emergencia(app: AppHandle, w: WebviewWindow, acel: String) -> bool {
         *atual = acel;
     }
     ok
+}
+
+fn atalho_permitido(acel: &str) -> bool {
+    let partes: Vec<String> = acel.split('+').map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).collect();
+    if partes.is_empty() || partes.len() > 4 || acel.len() > 60 {
+        return false;
+    }
+    const MODS: [&str; 9] = ["ctrl", "control", "alt", "shift", "super", "cmd", "command", "commandorcontrol", "cmdorctrl"];
+    let tem_mod = partes.iter().any(|p| MODS.contains(&p.as_str()));
+    let tecla_f = |p: &str| p.len() >= 2 && p.starts_with('f') && p[1..].parse::<u8>().map(|n| (1..=24).contains(&n)).unwrap_or(false);
+    let so_mods = partes.iter().all(|p| MODS.contains(&p.as_str()));
+    // As mesmas teclas que a página (config.js, SOZINHAS) deixa usar sozinhas.
+    const SOZINHAS: [&str; 5] = ["insert", "home", "end", "pageup", "pagedown"];
+    let sozinha_ok = |p: &str| tecla_f(p) || SOZINHAS.contains(&p);
+    !so_mods && (tem_mod || (partes.len() == 1 && sozinha_ok(&partes[0])))
 }
 
 // ---------- painel de desempenho ----------
@@ -898,7 +1178,7 @@ fn trazer_escolhas_antigas(app: &AppHandle) {
 pub fn args_principal() -> String {
     static ARGS: OnceLock<String> = OnceLock::new();
     ARGS.get_or_init(|| {
-        let mut a = String::from("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,WebRtcHideLocalIpsWithMdns,SpareRendererForSitePerProcess,Translate,MediaRouter,OptimizationHints,AutofillServerCommunication --autoplay-policy=no-user-gesture-required");
+        let mut a = String::from("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,WebRtcHideLocalIpsWithMdns,SpareRendererForSitePerProcess,Translate,MediaRouter,OptimizationHints,AutofillServerCommunication,CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required");
         if teste() {
             if let Ok(p) = std::env::var("ASTRA_CDP") {
                 a += &format!(" --remote-debugging-port={}", p.parse::<u16>().unwrap_or(9334));
@@ -929,11 +1209,12 @@ fn criar_principal(app: &AppHandle, oculto: bool) -> tauri::Result<()> {
         .additional_browser_args(&args)
         .initialization_script(ponte)
         // 2.7.33: a janela só mostra a página do programa.
-        .on_navigation(|u| u.scheme() == "http" && u.host_str() == Some("tauri.localhost") && (u.path() == "/" || u.path() == "/index.html"))
+        .on_navigation(|u| origem_exata(u, &["/", "/index.html"]))
         .on_new_window(move |url, recursos| janelas::nova_janela(&app_nova, url, recursos))
         // Câmera e microfone (voz e câmera da sala) só para a página do programa; o resto é "não".
         .on_permission_request(|w, tipo| {
-            let da_pagina = w.url().map(|u| u.host_str() == Some("tauri.localhost")).unwrap_or(false);
+            // 3.0.17 (ASTRA-005/014): só a página principal exata (sem porta, só /index.html).
+            let da_pagina = w.url().map(|u| origem_exata(&u, &["/", "/index.html"])).unwrap_or(false);
             match tipo {
                 PermissionKind::Microphone | PermissionKind::Camera | PermissionKind::Autoplay if da_pagina => PermissionResponse::Allow,
                 _ => PermissionResponse::Deny,
@@ -943,7 +1224,11 @@ fn criar_principal(app: &AppHandle, oculto: bool) -> tauri::Result<()> {
             let app = &app_carga;
             match p.event() {
                 // A página recarregou: as capturas abertas por ela não servem mais.
-                PageLoadEvent::Started => janelas::fechar_todas_capturas(app),
+                // 3.0.17 (ASTRA-003): e o som, as teclas e o silêncio também (antes sobreviviam ao reload).
+                PageLoadEvent::Started => {
+                    encerrar_captura(app);
+                    janelas::fechar_todas_capturas(app);
+                }
                 PageLoadEvent::Finished => {
                     if let Some(w) = principal(app) {
                         janelas::avisar_falha(&w);
@@ -1023,12 +1308,12 @@ fn main() {
         // Só uma cópia do programa aberta; abrir de novo só mostra a janela.
         .plugin(tauri_plugin_single_instance::init(|app, _, _| mostrar(app)))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(com_registro(tauri::generate_handler![
             ponte_eventos, aviso, transmitindo, relaxado, acorde, mostrar_janela, janela, proteger_tela, gravador_nvidia,
             popup_chat, popup_vazio, fechar_mini, listar_fontes, definir_fonte, captura_iniciar, captura_parar, sinal_principal, sinal_captura,
             som_iniciar, som_parar, silencio, teclas, risco, tecla_emergencia, desempenho, conferir_modulo, atualizar,
             sem_mouse_salvar, reiniciar
-        ])
+        ]))
         .setup(move |app| {
             let mut pasta = app.path().app_data_dir()?;
             if teste() {
@@ -1072,6 +1357,7 @@ fn main() {
                 sistema::migrar_iniciar_com_windows();
             }
             criar_principal(&h, oculto)?;
+            vigia_linha_principal(&h);
             criar_bandeja(&h)?;
             Ok(())
         })

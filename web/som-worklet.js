@@ -22,9 +22,9 @@ class AstraSom extends AudioWorkletProcessor {
       this.escrever = (this.escrever + 1) % this.tam;
     }
     this.cheio += quadros;
-    // Mais de 200 ms guardados = atraso: pula para perto do fim.
-    if (this.cheio > 9600) {
-      const pular = this.cheio - 1920;
+    // 3.0.13: chegam pedaços de ~80 ms. Mais de 250 ms guardados = atraso: pula para perto do fim.
+    if (this.cheio > 12000) {
+      const pular = this.cheio - 4800;
       this.ler = (this.ler + pular) % this.tam;
       this.cheio -= pular;
     }
@@ -33,7 +33,7 @@ class AstraSom extends AudioWorkletProcessor {
   process(_entradas, saidas) {
     const [e, d] = saidas[0];
     const n = e.length;
-    if (!this.tocando && this.cheio >= 1920) this.tocando = true;   // espera juntar 40 ms
+    if (!this.tocando && this.cheio >= 4800) this.tocando = true;   // espera juntar 100 ms (3.0.13: pedaços de 80 ms)
     if (!this.tocando || this.cheio < n) {
       this.tocando = this.cheio >= n;
       return true;   // silêncio

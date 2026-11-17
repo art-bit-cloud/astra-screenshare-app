@@ -54,6 +54,9 @@ fn versao_do_nome(nome: &str) -> Option<String> {
     }
 }
 
+// O instalador tem ~3,5 MB; 300 MB é folga de sobra e impede encher o disco.
+const TETO: u64 = 300 * 1024 * 1024;
+
 fn sha256_do_arquivo(c: &std::path::Path) -> std::io::Result<String> {
     let mut f = std::fs::File::open(c)?;
     let mut h = Sha256::new();
@@ -72,7 +75,15 @@ fn sha256_do_arquivo(c: &std::path::Path) -> std::io::Result<String> {
 // Devolve o caminho do instalador já conferido; quem chama abre ele e fecha o programa.
 pub fn baixar_e_conferir(site: &str, versao_atual: &str, progresso: impl Fn(i64)) -> Result<std::path::PathBuf, String> {
     let base = site.trim_end_matches('/').to_string() + "/";
-    let agente = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(15)).build();
+    // 3.0.17 (ASTRA-013): tempo máximo, só HTTPS (inclusive nos redirecionamentos) e teto de tamanho.
+    let so_https = !cfg!(feature = "teste");
+    let agente = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(15))
+        .timeout_read(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(20 * 60))
+        .https_only(so_https)
+        .redirects(3)
+        .build();
     let resp = agente.get(&format!("{}baixar/pc", base)).set("Cache-Control", "no-store").call()
         .map_err(|e| format!("o servidor respondeu {}", e))?;
     let cd = resp.header("content-disposition").unwrap_or("").to_string();
@@ -82,6 +93,9 @@ pub fn baixar_e_conferir(site: &str, versao_atual: &str, progresso: impl Fn(i64)
         return Err("o servidor ofereceu uma versão que não é mais nova que a sua".into());
     }
     let total: u64 = resp.header("content-length").and_then(|x| x.parse().ok()).unwrap_or(0);
+    if total > TETO {
+        return Err("o instalador oferecido é grande demais".into());
+    }
     // Pasta nova e aleatória a cada atualização.
     let aleatorio = format!("{:x}{:x}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let pasta = std::env::temp_dir().join(format!("astra-atualizacao-{}", aleatorio));
@@ -101,6 +115,9 @@ pub fn baixar_e_conferir(site: &str, versao_atual: &str, progresso: impl Fn(i64)
             resumo.update(&buf[..n]);
             arquivo.write_all(&buf[..n]).map_err(|e| e.to_string())?;
             recebido += n as u64;
+            if recebido > TETO {
+                return Err("o instalador oferecido é grande demais".into());
+            }
             let pct = if total > 0 { (recebido * 100 / total) as i64 } else { 0 };
             if pct != ultimo {
                 ultimo = pct;

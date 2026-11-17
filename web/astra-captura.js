@@ -11,8 +11,11 @@
   const pc = new RTCPeerConnection({ iceServers: [] });
 
   // Dentro do PC não há rede no meio: começa e fica em bitrate alto (a principal recodifica para os amigos).
+  // 3.0.11: era 15-40 Mbps fixo (até em 720p30): codificar e decodificar isso dentro do PC pesava
+  // demais. Agora proporcional ao que foi escolhido (1080p60 ~ 12 Mbps, 4K60 até 30 Mbps).
+  const kbps = Math.max(6000, Math.min(30000, Math.round(num("l", 1920) * num("a", 1080) * num("q", 60) / 10000)));
   const bitrateAlto = (sdp) => sdp.replace(/(a=fmtp:\d+ [^\r\n]*packetization-mode=1[^\r\n]*)/g,
-    "$1;x-google-min-bitrate=15000;x-google-start-bitrate=25000;x-google-max-bitrate=40000");
+    `$1;x-google-min-bitrate=${Math.round(kbps / 3)};x-google-start-bitrate=${Math.round(kbps * 0.8)};x-google-max-bitrate=${kbps}`);
   window.__sinal = async (texto) => {
     try {
       const m = JSON.parse(texto);
@@ -42,7 +45,7 @@
   const alto = (c) => /profile-level-id=(4d|64)/i.test(c.sdpFmtpLine || "");
   tr.setCodecPreferences([...codecs.filter((c) => h264(c) && alto(c)), ...codecs.filter((c) => h264(c) && !alto(c)), ...codecs.filter((c) => !h264(c))]);
   const p = tr.sender.getParameters();
-  p.encodings = [{ maxBitrate: 40_000_000, maxFramerate: num("q", 60) }];
+  p.encodings = [{ maxBitrate: kbps * 1000, maxFramerate: num("q", 60) }];
   p.degradationPreference = "maintain-resolution";
   await tr.sender.setParameters(p).catch(() => {});
   pc.onconnectionstatechange = () => { if (pc.connectionState === "failed") enviar({ erro: "a conexão com a janela principal caiu" }); };

@@ -903,14 +903,16 @@ li:hover > .pv-abrir { opacity: 1; background: var(--fundo-3); color: var(--text
 .papel-editor-rodape #pp-trocar { margin-right: auto; }
 
 /* ---------- Programa do PC sem a barra do Windows (2.7.8) ---------- */
-/* Arrasta a janela pelo topo das colunas; os botões continuam clicáveis. */
-:root.sem-moldura .lateral-topo, :root.sem-moldura .barra-topo, .barra-janela { -webkit-app-region: drag; }
+/* Arrasta a janela pelo topo das colunas; os botões continuam clicáveis.
+   3.0.16: --arrastar (lido pela ponte) no lugar de -webkit-app-region: o WebView2 criava uma janela-filha
+   para cada pedaço da área (~200) e recriava todas a cada mudança na barra = "Não está respondendo". */
+:root.sem-moldura .lateral-topo, :root.sem-moldura .barra-topo, .barra-janela { --arrastar: 1; }
 :root.sem-moldura .lateral-topo :is(button, a, input, select),
-:root.sem-moldura .barra-topo :is(button, a, input, select) { -webkit-app-region: no-drag; }
+:root.sem-moldura .barra-topo :is(button, a, input, select) { --arrastar: 0; }
 /* Os botões de minimizar/maximizar/fechar ficam no canto de cima da coluna da direita. */
 :root.sem-moldura .online { position: relative; padding-top: 42px; }
 .barra-janela { position: fixed; top: 0; right: 0; width: 272px; z-index: 80; height: 36px; display: flex; justify-content: flex-end; align-items: center; gap: 4px; padding: 0 8px; }
-.bt-janela { -webkit-app-region: no-drag; width: 28px; height: 24px; border: 0; border-radius: 8px; background: transparent; color: var(--fraco);
+.bt-janela { --arrastar: 0; width: 28px; height: 24px; border: 0; border-radius: 8px; background: transparent; color: var(--fraco);
   display: grid; place-items: center; cursor: pointer; transition: background .12s, color .12s; }
 .bt-janela:hover { background: var(--fundo-3); color: var(--texto-forte); }
 .bt-janela:active { transform: scale(.94); }

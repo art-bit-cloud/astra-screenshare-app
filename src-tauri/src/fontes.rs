@@ -24,6 +24,12 @@ pub struct Fonte {
     pub retangulo: Option<(i32, i32, i32, i32)>,
 }
 
+// 3.0.17 (ASTRA-002): a escolha `f` é ambígua se o pedaço que vai para o WebView2 aparece no nome
+// de outra fonte da mesma lista (o WebView2 pegaria a primeira que tiver o pedaço).
+pub fn selecao_ambigua(f: &Fonte, lista: &[Fonte]) -> bool {
+    crate::ambiguidade::ambigua(&f.selecao, lista.iter().filter(|g| g.id != f.id).map(|g| g.nome.as_str()))
+}
+
 pub fn listar() -> Vec<Fonte> {
     let mut lista = Vec::new();
     let monitores = monitores();

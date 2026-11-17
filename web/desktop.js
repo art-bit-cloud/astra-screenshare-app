@@ -126,7 +126,14 @@
     } catch (_) {}
     $("seletor").hidden = true;
     try {
-      await comLimite(astra.definirFonte({ id: escolhida.id, som: opcoes.som }), 8000);
+      const r = await comLimite(astra.definirFonte({ id: escolhida.id, som: opcoes.som }), 8000);
+      // 3.0.17: outra janela/tela tem nome parecido; o Windows poderia transmitir a errada.
+      if (r && r.motivo === "ambigua") {
+        aviso({ titulo: "Tem outra janela com nome parecido",
+                texto: "Para não transmitir a janela errada, feche a outra janela com o mesmo nome (ou escolha a Tela inteira) e tente de novo.",
+                tempo: 12000 });
+        return;
+      }
       await window.iniciarTela(opcoes);
     } catch (e) {
       console.warn("transmitir falhou", e);

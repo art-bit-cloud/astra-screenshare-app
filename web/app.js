@@ -896,13 +896,11 @@ function desenharDiscord() {
     botoes.append(bt);
   };
   if (!d.conectado) {
-    texto.textContent = `Faz parte do servidor no Discord? Conecte para entrar na sala ${d.nomeSala || "do servidor"}.`;
+    texto.textContent = "Conecte o seu Discord para ganhar o selo \"Conta verificada pelo Discord\" e poder entrar pelo Discord no site.";
     botao("Conectar com o Discord", "discord", abrirDiscord);
   } else {
-    texto.textContent = d.membro
-      ? `✓ Conectado como ${d.nome}. Você está no servidor e pode entrar na sala ${d.nomeSala}.`
-      : `Conectado como ${d.nome}, mas essa conta não está no servidor do Discord.`;
-    botao("Conferir de novo", "secundario", abrirDiscord);
+    texto.textContent = `✓ Discord conectado como ${d.nome}.`;
+    botao("Conectar de novo", "secundario", abrirDiscord);
     botao("Desconectar", "perigo", () => enviar({ t: "discord", acao: "desconectar" }));
   }
   const dica = document.createElement("div");
@@ -1497,7 +1495,7 @@ const TRATAR = {
     estado.discord = m;
     desenharDiscord();
     redesenharPerfis();
-    if (m.membro && !antes && m.conectado) aviso({ titulo: "Discord conectado!", texto: `Você já pode entrar na sala ${m.nomeSala}.`, tempo: 6000 });
+    if (m.membro && !antes && m.conectado) aviso({ titulo: "Discord conectado!", texto: `Conectado como ${m.nome}.`, tempo: 6000 });
   },
   perfil(m) {
     if (m.erro) aviso({ titulo: m.erro });
@@ -4451,7 +4449,7 @@ async function iniciarTela(opcoes) {
   if (!programa && estado.superficie !== "browser") esconderPrevia(true);
   atualizarPrevia();
   // Modo leve (opção do programa do PC): a tela vai uma vez só para a ponte da VPS.
-  estado.leve = !celular && ((!!programa && opcoes.leve === "sim") || salaGrande());   // sala com mais de 8: ponte sozinha
+  estado.leve = !celular && ((!!programa && opcoes.leve === "sim") || salaGrande());   // 2 ou mais na sala: ponte sozinha (3.0.11)
   if (estado.leve) {
     const ok = await publicarNaPonte();
     if (estado.tela !== stream) return;   // parou enquanto ligava
@@ -4464,6 +4462,9 @@ async function iniciarTela(opcoes) {
   for (const par of estado.pares.values()) if (!(estado.ponte && par.ponteOk)) enviarTela(par);
 }
 window.iniciarTela = iniciarTela;
+// 3.0.17: o "Parar transmissão" do ícone perto do relógio já desligou tudo no programa; aqui só a página
+// acompanha (botões, sala e avisar o servidor).
+window.pararTelaPeloIcone = () => { if (souAoVivo()) pararTela(); };
 
 // O app Android começou a transmitir (o Java já está capturando a tela).
 function aoComecarCelular(telaId) {
@@ -4722,7 +4723,10 @@ function usarSemPonte(motivo) {
 // v5.1 tinha baixado para 3 pessoas, mas aí quase toda live passava pela VPS (longe, nos EUA)
 // e a imagem quadriculava quando a internet apertava. 2.7.20 (pedido do dono): a ponte só
 // liga sozinha com mais de 8 pessoas na sala; até 8 a tela vai sempre direto.
-const PONTE_AUTO_ACIMA = 8;
+// 3.0.11: era 8. Com a captura em janela separada (3.0), cada espectador direto custa mais uma
+// codificação 1080p60 no PC de quem transmite: passou do limite da placa, cai no processador (CPU 100%,
+// tela branca). Agora a partir de 2 espectadores a tela vai UMA vez só para a ponte da VPS.
+const PONTE_AUTO_ACIMA = 2;
 function salaGrande() { return estado.pares.size + 1 > PONTE_AUTO_ACIMA; }
 let ligandoPonteAuto = false;
 async function ponteAutomatica() {
@@ -4734,7 +4738,7 @@ async function ponteAutomatica() {
   if (!ok || estado.tela !== tela) return;
   estado.leve = true;
   enviarEstado();
-  aviso({ titulo: "Transmissão pela ponte", texto: "Sala com mais de 8 pessoas: a tela vai uma vez só para a VPS, na mesma qualidade.", tempo: 6000 });
+  aviso({ titulo: "Transmissão pela ponte", texto: "Mais de uma pessoa assistindo: a tela vai uma vez só para a VPS, na mesma qualidade (menos peso no seu PC).", tempo: 6000 });
   // Dá um tempo para todo mundo ligar na ponte e só então para de mandar direto
   // (quem está numa versão sem a ponte continua recebendo direto).
   setTimeout(() => {

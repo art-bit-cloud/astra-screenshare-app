@@ -14,9 +14,32 @@ publicado para que qualquer pessoa possa conferir o que o programa faz no seu co
 | `src-tauri/tauri.conf.json` | configuração do app e do instalador |
 | `src-tauri/Cargo.toml` / `Cargo.lock` | dependências com versões exatas |
 | `src-tauri/instalador.nsh` | passos extras do instalador (NSIS) |
+| `src-tauri/icons/` | ícones (necessários para compilar) |
+| `src-tauri/som/astra-audio.exe` | auxiliar de som/teclas (**só o binário**; o código dele ainda não está aqui) |
+| `package.json` / `package-lock.json` | ferramentas de build (Tauri CLI) com versões exatas |
 | `web/` | a interface embutida no app |
 
 O servidor não faz parte deste repositório.
+
+## Versão deste código
+**3.0.17** — o mesmo código do instalador `AstraScreenShare-Instalador-3.0.17.exe` distribuído em astrascreenshare.com.
+
+| Arquivo | SHA-256 |
+|---|---|
+| `AstraScreenShare-Instalador-3.0.17.exe` | `fc760b4facd234e3efd2cff8392c4910618115ad0cc21e4dba6d99a25fb6b354` |
+| `src-tauri/som/astra-audio.exe` | `8c5b761bf052a47539e640f0157069745cbad8098fce6a80496dc9e188c86880` |
+
+O instalador não é byte a byte reproduzível (carimbo de tempo do NSIS e da compilação), mas sai deste código com:
+
+```
+npm ci
+npx tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc
+```
+
+Correções da 3.0.17 (auditoria de segurança de 16/11/2026): a captura inteira (tela, som, teclas, "não perturbe")
+para no programa ao parar, ao recarregar a página e pelo ícone perto do relógio, mesmo com a página travada;
+escolha de janela com nome ambíguo é recusada; origem exata da página; atualizador com tempo máximo, só HTTPS e
+teto de tamanho; atalho global só com modificador; teclas só com a janela transmitida em foco.
 
 ## Conferir o instalador
 Os manifestos com o SHA-256 de cada arquivo e do instalador, assinados com a chave do app,
