@@ -43,7 +43,9 @@ pub fn pasta_perfil(app: &AppHandle, rotulo: &str) -> std::path::PathBuf {
 pub fn abrir_captura(app: &AppHandle, selecao: &str, sem_mouse: bool, largura: u32, altura: u32, qps: u32) -> Result<String, String> {
     let j = &estado(app).janelas;
     // A anterior (se sobrou) fecha antes.
-    if let Some(velha) = j.captura_atual.lock().unwrap().take() {
+    // 3.0.19: pega e SOLTA a trava antes de fechar (o fechar_captura pede a mesma trava).
+    let velha = j.captura_atual.lock().unwrap().take();
+    if let Some(velha) = velha {
         fechar_captura(app, &velha);
     }
     let rotulo = if j.vez_captura.fetch_add(1, SeqCst) % 2 == 0 { "cap-a" } else { "cap-b" }.to_string();
@@ -420,7 +422,8 @@ pub fn popup_vazio(app: &AppHandle) {
 fn enviar_desenho(app: &AppHandle, r: String) {
     let Some(w) = app.get_webview_window("desenho") else { return };
     if !w.is_visible().unwrap_or(false) {
-        if let Some((x, y, l, a)) = *estado(app).tela_da_live.lock().unwrap() {
+        let tela = *estado(app).tela_da_live.lock().unwrap();
+        if let Some((x, y, l, a)) = tela {
             let _ = w.set_position(PhysicalPosition::new(x, y));
             let _ = w.set_size(PhysicalSize::new(l as u32, a as u32));
         }

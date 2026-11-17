@@ -562,7 +562,10 @@ fn encerrar_captura(app: &AppHandle) {
     *st.escolha.lock().unwrap() = None;
     *st.ultimo_som.lock().unwrap() = None;
     *st.tela_da_live.lock().unwrap() = None;
-    if let Some(r) = st.janelas.captura_atual.lock().unwrap().clone() {
+    // 3.0.19: copia ANTES e solta a trava (o "if let" segurava a trava e o fechar_captura pedia a mesma:
+    // a linha principal travava ao parar a transmissão).
+    let atual = st.janelas.captura_atual.lock().unwrap().clone();
+    if let Some(r) = atual {
         janelas::fechar_captura(app, &r);
     }
     janelas::proteger_janelas(app);
@@ -712,7 +715,8 @@ async fn listar_fontes(app: AppHandle, w: WebviewWindow) -> Vec<fontes::Fonte> {
         }
         *u = Some(Instant::now());
     }
-    let lista = tauri::async_runtime::spawn_blocking(fontes::listar).await.unwrap_or_default();
+    let sem_mouse = st.sem_mouse;
+    let lista = tauri::async_runtime::spawn_blocking(move || fontes::listar(sem_mouse)).await.unwrap_or_default();
     *st.ultimas_fontes.lock().unwrap() = lista.clone();
     lista
 }

@@ -30,9 +30,11 @@ pub fn selecao_ambigua(f: &Fonte, lista: &[Fonte]) -> bool {
     crate::ambiguidade::ambigua(&f.selecao, lista.iter().filter(|g| g.id != f.id).map(|g| g.nome.as_str()))
 }
 
-pub fn listar() -> Vec<Fonte> {
+// `sem_mouse` = a captura vai sem o WGC (opção "esconder o mouse em jogos", padrão). Ela muda a ORDEM em
+// que o WebView2 numera as telas, e o nome "Tela N" daqui tem que bater com o dele.
+pub fn listar(sem_mouse: bool) -> Vec<Fonte> {
     let mut lista = Vec::new();
-    let monitores = monitores();
+    let monitores = monitores(sem_mouse);
     let varios = monitores.len() > 1;
     for (i, r) in monitores.iter().enumerate() {
         let nome = if varios { format!("Tela {}", i + 1) } else { "Tela inteira".to_string() };
@@ -71,15 +73,58 @@ fn pedaco_seguro(titulo: &str) -> String {
     if melhor.is_empty() { titulo.to_string() } else { melhor.to_string() }
 }
 
-fn monitores() -> Vec<RECT> {
-    unsafe extern "system" fn cada(_m: HMONITOR, _dc: HDC, r: *mut RECT, l: LPARAM) -> BOOL {
-        let v = &mut *(l.0 as *mut Vec<RECT>);
-        v.push(*r);
+// 3.0.19: TELAS INVERTIDAS. O WebView2 chama de "Tela 1, Tela 2..." na ordem dele, e a escolha vai pelo
+// nome. Sem o WGC (padrão: esconder o mouse), o capturador dele (GDI/DirectX) numera na ordem dos
+// dispositivos do Windows (EnumDisplayDevices: \\.\DISPLAY1, 2...). Com o WGC, na ordem do
+// EnumDisplayMonitors. Antes daqui saía sempre a ordem do EnumDisplayMonitors -> com o mouse escondido, a
+// "Tela 1" daqui podia ser a "Tela 2" dele.
+fn monitores(sem_mouse: bool) -> Vec<RECT> {
+    unsafe extern "system" fn cada(m: HMONITOR, _dc: HDC, r: *mut RECT, l: LPARAM) -> BOOL {
+        let v = &mut *(l.0 as *mut Vec<(HMONITOR, RECT)>);
+        v.push((m, *r));
         BOOL(1)
     }
-    let mut v: Vec<RECT> = Vec::new();
+    let mut v: Vec<(HMONITOR, RECT)> = Vec::new();
     unsafe {
         let _ = EnumDisplayMonitors(None, None, Some(cada), LPARAM(&mut v as *mut _ as isize));
+    }
+    if !sem_mouse {
+        return v.into_iter().map(|(_, r)| r).collect();
+    }
+    let ordem = ordem_dos_dispositivos();
+    let mut com_posicao: Vec<(usize, RECT)> = v.into_iter().enumerate().map(|(i, (m, r))| {
+        let pos = nome_do_monitor(m).and_then(|n| ordem.iter().position(|o| *o == n)).unwrap_or(1000 + i);
+        (pos, r)
+    }).collect();
+    com_posicao.sort_by_key(|x| x.0);   // estável: sem nome conhecido, fica na ordem de antes
+    com_posicao.into_iter().map(|x| x.1).collect()
+}
+
+fn texto_w(w: &[u16]) -> String {
+    let n = w.iter().position(|&c| c == 0).unwrap_or(w.len());
+    String::from_utf16_lossy(&w[..n])
+}
+
+// "\\.\DISPLAY2" do monitor.
+fn nome_do_monitor(m: HMONITOR) -> Option<String> {
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    let ok = unsafe { GetMonitorInfoW(m, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) }.as_bool();
+    ok.then(|| texto_w(&info.szDevice))
+}
+
+// Os dispositivos de vídeo ATIVOS na ordem do Windows (a mesma que o capturador do WebView2 usa).
+fn ordem_dos_dispositivos() -> Vec<String> {
+    let mut v = Vec::new();
+    for i in 0..64u32 {
+        let mut dd = DISPLAY_DEVICEW::default();
+        dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+        if !unsafe { EnumDisplayDevicesW(windows::core::PCWSTR::null(), i, &mut dd, 0) }.as_bool() {
+            break;
+        }
+        if dd.StateFlags.0 & DISPLAY_DEVICE_ACTIVE.0 != 0 {
+            v.push(texto_w(&dd.DeviceName));
+        }
     }
     v
 }
